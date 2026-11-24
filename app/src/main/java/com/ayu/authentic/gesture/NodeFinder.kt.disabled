@@ -1,0 +1,85 @@
+package com.ayu.authentic.gesture
+
+import android.accessibilityservice.AccessibilityService
+import android.view.accessibility.AccessibilityNodeInfo
+import com.ayu.authentic.config.Config
+import com.ayu.authentic.util.ALog
+
+/**
+ * 系统层 / 控制台 App 内部的精准无障碍节点定位。
+ * 严格遵守：findAccessibilityNodeInfosByViewId / findAccessibilityNodeInfosByText，
+ * 不做全局 OCR、不做视觉截图点击。
+ */
+class NodeFinder(private val service: AccessibilityService) {
+
+    /** 当前窗口根节点 */
+    private fun root(): AccessibilityNodeInfo? = try {
+        service.rootInActiveWindow
+    } catch (t: Throwable) {
+        ALog.e("取 rootInActiveWindow 失败", t); null
+    }
+
+    /** 按 ViewId 精确找（控制台 App 自有的 id） */
+    fun byId(viewId: String): List<AccessibilityNodeInfo> =
+        root()?.findAccessibilityNodeInfosByViewId(viewId)?.toList() ?: emptyList()
+
+    /** 按文本精确/包含找（QQ 授权页「同意」「切换账号」等） */
+    fun byText(text: String, exact: Boolean = true): List<AccessibilityNodeInfo> {
+        val r = root() ?: return emptyList()
+        // 优先用系统 API 精确定位
+        val exactHits = r.findAccessibilityNodeInfosByText(text)
+        if (exactHits.isNotEmpty()) return exactHits.toList()
+        if (exact) return emptyList()
+        // 兜底：遍历子树做包含匹配（仍是节点文本，不是 OCR）
+        return walk(r).filter { it.text?.toString()?.contains(text) == true }
+    }
+
+    /** 任一关键字命中即返回该节点 */
+    fun byAnyText(vararg texts: String): AccessibilityNodeInfo? {
+        for (t in texts) {
+            val hit = byText(t).firstOrNull { it.isClickable || it.parent?.isClickable == true }
+            if (hit != null) return clickableOf(hit)
+        }
+        return null
+    }
+
+    /** 找到并点击文本节点；返回是否点到 */
+    fun clickText(text: String, vararg others: String): Boolean {
+        val node = byAnyText(text, *others) ?: return false
+        return click(node)
+    }
+
+    fun clickId(viewId: String): Boolean {
+        val node = byId(viewId).firstOrNull() ?: return false
+        return click(clickableOf(node))
+    }
+
+    fun click(node: AccessibilityNodeInfo): Boolean {
+        val target = clickableOf(node)
+        val ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        ALog.i("节点点击 [${target.text ?: target.viewIdResourceName ?: "?"}] ok=$ok")
+        return ok
+    }
+
+    /** 节点本身不可点时，往上找可点祖先 */
+    private fun clickableOf(n: AccessibilityNodeInfo): AccessibilityNodeInfo {
+        var cur: AccessibilityNodeInfo? = n
+        var guard = 0
+        while (cur != null && !cur.isClickable && guard++ < 6) cur = cur.parent
+        return cur ?: n
+    }
+
+    /** 读取所有节点文本（供风控关键词判定，仍是节点树，不是 OCR） */
+    fun allTexts(): List<String> =
+        root()?.let { walk(it).mapNotNull { n -> n.text?.toString() } } ?: emptyList()
+
+    private fun walk(n: AccessibilityNodeInfo, acc: MutableList<AccessibilityNodeInfo> = mutableListOf()): List<AccessibilityNodeInfo> {
+        acc.add(n)
+        for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, acc) }
+        return acc
+    }
+
+    /** 包名隔离：只处理白名单包 */
+    fun isWatched(pkg: CharSequence?): Boolean =
+        pkg != null && Config.WATCHED_PACKAGES.contains(pkg.toString())
+}

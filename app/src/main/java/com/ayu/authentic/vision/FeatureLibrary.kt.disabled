@@ -1,0 +1,85 @@
+package com.ayu.authentic.vision
+
+import com.ayu.authentic.config.Config
+import com.ayu.authentic.model.Phase
+import com.ayu.authentic.model.Station
+
+/**
+ * 图色特征库（预留接口 + 状态定义）
+ *
+ * 真机上只需把 features/stations/ 下的模板图片与下面的颜色规则替换掉，
+ * 业务层（状态机、轮询）完全不用改。
+ *
+ * 目录约定：
+ *   features/stations/{station}_{phase}.png
+ *   例：tech_ready.png / workbench_producing.png / armor_idle.png
+ */
+data class ColorRule(
+    /** 目标颜色 0xAARRGGBB */
+    val argb: Int,
+    /** RGB 各通道容差 0..255 */
+    val tolerance: Int = 24,
+    /** 区域内至少命中多少像素才算有效 */
+    val minHitPixels: Int = 20,
+    /** 只在哪个子区域里找（基准 2400x1080） */
+    val roi: Config.Region
+)
+
+/**
+ * 一条特征 = 一张模板 + 若干找色规则。
+ * 命中判定：模板相似度与找色命中率取加权，超过 threshold 才算。
+ */
+data class TemplateFeature(
+    val id: String,
+    val templatePath: String,
+    val station: Station,
+    val phase: Phase,
+    val colorRules: List<ColorRule> = emptyList(),
+    val threshold: Float = 0.78f
+)
+
+/** 特征库：默认给四个台子 x 三种状态各留一个占位特征，真机替换 */
+object FeatureLibrary {
+
+    private const val DIR = "features/stations"
+
+    private val cache = mutableMapOf<String, TemplateFeature>()
+
+    /** 每个台子卡片右上角那一小块「黄标/倒计时」区域，用于找色 */
+    private fun badgeRoi(s: Station): Config.Region {
+        val r = Config.STATION_REGIONS[s] ?: Config.Region(0, 0, 100, 100)
+        return Config.Region(r.right - 90, r.top, r.right, r.top + 90)
+    }
+
+    private fun feature(s: Station, p: Phase): TemplateFeature {
+        val key = "${s.name.lowercase()}_${p.name.lowercase()}"
+        return cache.getOrPut(key) {
+            val color = when (p) {
+                // 黄色感叹号 = 待收取；灰蓝扳手 = 生产中；虚线加号 = 空闲
+                // 用 android.graphics.Color.argb 生成，避开 Kotlin 无符号字面量歧义
+                Phase.READY -> android.graphics.Color.argb(255, 255, 200, 51)
+                Phase.PRODUCING -> android.graphics.Color.argb(255, 110, 124, 140)
+                Phase.IDLE -> android.graphics.Color.argb(255, 58, 68, 80)
+            }
+            TemplateFeature(
+                id = key,
+                templatePath = "$DIR/$key.png",
+                station = s,
+                phase = p,
+                colorRules = listOf(
+                    ColorRule(argb = color, tolerance = 28, minHitPixels = 24, roi = badgeRoi(s))
+                )
+            )
+        }
+    }
+
+    fun featuresOf(s: Station): List<TemplateFeature> =
+        Phase.values().map { feature(s, it) }
+
+    fun all(): List<TemplateFeature> = Station.values().flatMap { featuresOf(it) }
+
+    /** 真机灌库入口：外部把采集好的特征注册进来即可 */
+    fun register(f: TemplateFeature) { cache[f.id] = f }
+
+    fun clearCache() { cache.clear() }
+}

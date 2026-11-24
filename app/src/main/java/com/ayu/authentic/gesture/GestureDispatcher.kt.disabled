@@ -1,0 +1,70 @@
+package com.ayu.authentic.gesture
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.graphics.Path
+import android.os.Build
+import com.ayu.authentic.config.Config
+import com.ayu.authentic.util.ALog
+import kotlinx.coroutines.delay
+
+/**
+ * 手势分发：把「基准 2400x1080 坐标」换算到真机分辨率，再用无障碍手势点击。
+ * 系统层节点能点时优先走 NodeFinder 的 performAction(ACTION_CLICK)；
+ * UE4 画面没有节点，才用这里的坐标点击。
+ */
+class GestureDispatcher(private val service: AccessibilityService) {
+
+    private var realW = 0
+    private var realH = 0
+
+    fun updateDisplay(w: Int, h: Int) {
+        realW = w
+        realH = h
+    }
+
+    private fun sx(baseX: Int): Float =
+        if (realW > 0) baseX * realW / Config.BASE_W.toFloat() else baseX.toFloat()
+
+    private fun sy(baseY: Int): Float =
+        if (realH > 0) baseY * realH / Config.BASE_H.toFloat() else baseY.toFloat()
+
+    /** 单击基准坐标 */
+    suspend fun tap(baseX: Int, baseY: Int, settleMs: Long = Config.UI_SETTLE_MS) {
+        val x = sx(baseX); val y = sy(baseY)
+        val path = Path().apply { moveTo(x, y) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 60)
+        val desc = GestureDescription.Builder().addStroke(stroke).build()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            service.dispatchGesture(desc, null, null)
+        } else {
+            ALog.w("系统低于 N，dispatchGesture 不可用，需 root/input 兜底")
+        }
+        delay(settleMs)
+        ALog.i("点击 (${baseX},${baseY}) -> 真机 (${x.toInt()},${y.toInt()})")
+    }
+
+    suspend fun tapRegion(r: Config.Region, settleMs: Long = Config.UI_SETTLE_MS) =
+        tap(r.cx, r.cy, settleMs)
+
+    /** 长按（如退回登录页等场景） */
+    suspend fun longPress(baseX: Int, baseY: Int, durationMs: Long = 800) {
+        val x = sx(baseX); val y = sy(baseY)
+        val path = Path().apply { moveTo(x, y) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, durationMs)
+        service.dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+        delay(durationMs)
+    }
+
+    /** 全局返回键 */
+    suspend fun back(settleMs: Long = Config.UI_SETTLE_MS) {
+        service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+        delay(settleMs)
+    }
+
+    /** 回桌面 */
+    suspend fun home() {
+        service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+        delay(Config.UI_SETTLE_MS)
+    }
+}

@@ -1,0 +1,108 @@
+package com.ayu.authentic.scheduler
+
+import com.ayu.authentic.config.Config
+import com.ayu.authentic.core.AccountRepository
+import com.ayu.authentic.core.ManufactureStateMachine
+import com.ayu.authentic.core.RiskGuard
+import com.ayu.authentic.model.Account
+import com.ayu.authentic.model.AccountError
+import com.ayu.authentic.util.ALog
+import kotlinx.coroutines.*
+import kotlin.coroutines.coroutineContext
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * 定时轮询调度器
+ *
+ * - 每隔 POLL_INTERVAL_MS 巡检一次各账号四台子的冷却时间戳；
+ * - 到点（READY 或 finishAtMs 已过）才把账号排进队列；
+ * - 智能合并：同一账号多台子相差 MERGE_WINDOW_MS 内合并成一趟，避免频繁切号；
+ * - 风控拦截到的账号自动跳过，切下一个；
+ * - 「开启定时」是总开关（对齐 GAuto 文档）。
+ */
+class PollScheduler(
+    private val repo: AccountRepository,
+    private val machine: ManufactureStateMachine,
+    private val risk: RiskGuard,
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+) {
+    private val running = AtomicBoolean(false)
+    private var job: Job? = null
+
+    /** 总开关：控制台「开始定时」按钮调用 */
+    fun start() {
+        if (!running.compareAndSet(false, true)) return
+        ALog.i("==== 开启定时（总开关）====")
+        job = scope.launch {
+            while (isActive && running.get()) {
+                try {
+                    tick()
+                } catch (t: Throwable) {
+                    ALog.e("轮询异常", t)
+                }
+                delay(Config.POLL_INTERVAL_MS)
+            }
+        }
+    }
+
+    fun stop() {
+        running.set(false)
+        job?.cancel()
+        ALog.i("==== 停止定时 ====")
+    }
+
+    val isRunning: Boolean get() = running.get()
+
+    /** 每轮巡检开始前的前置钩子（由服务注入：检测游戏是否在前台，不在则重新拉起） */
+    var preRoundHook: (suspend () -> Unit)? = null
+
+    /** 单次立即巡检（控制台「立即收一轮」按钮 / 广播 ACTION_RUN_ONCE 用） */
+    suspend fun runOnceForTest() {
+        ALog.i("手动触发单轮巡检")
+        tick()
+    }
+
+    /** 单次巡检：挑出到点的账号，依次上号 */
+    private suspend fun tick() {
+        // 前置：确认三角洲行动在前台，不在则自动拉起（见 GameLauncher）
+        preRoundHook?.invoke()
+        val now = System.currentTimeMillis()
+        val due = repo.enabled().filter { it.isAnyDue(now) }
+        if (due.isEmpty()) {
+            ALog.i("巡检：无到点账号，下次最早 ${nextDueText(now)}")
+            return
+        }
+        ALog.i("巡检：到点 ${due.size} 个 -> ${due.joinToString { it.nickname }}")
+
+        // 智能合并：按最早到点时间排序，同一账号合并窗口内只跑一趟
+        val ordered = due.sortedBy { it.earliestDueMs() }
+        for (acc in ordered) {
+            if (!coroutineContext.isActive) break
+            // 再确认一次没被风控拦下
+            if (acc.error != AccountError.NONE || acc.paused) continue
+            ALog.i("上号 ${acc.nickname}，合并窗口 ${Config.MERGE_WINDOW_MS / 60000} 分钟内其它台子一并处理")
+            val result = machine.runAccount(acc)
+            ALog.i("结果 ${acc.nickname}: 收${result.collected} 造${result.restarted} err=${result.error} ${result.message}")
+            // 跑完把到点的台子时间戳推进，避免同一轮重复上号
+            settle(acc, now)
+        }
+    }
+
+    /** 跑完后把已处理的台子 finishAt 往后推，防止死循环 */
+    private fun settle(acc: Account, now: Long) {
+        acc.stations.values.forEach { st ->
+            if (st.phase == com.ayu.authentic.model.Phase.READY) {
+                st.phase = com.ayu.authentic.model.Phase.PRODUCING
+                st.finishAtMs = now + (ManufactureStateMachine.DEFAULT_DURATION_MS[st.station] ?: 8 * 3600_000L)
+            }
+        }
+    }
+
+    private fun nextDueText(now: Long): String {
+        val t = repo.enabled().mapNotNull { a ->
+            a.stations.values.map { it.finishAtMs }.filter { it > now }.minOrNull()
+        }.minOrNull() ?: return "无"
+        val min = (t - now) / 60000
+        return "${min}分钟后"
+    }
+}

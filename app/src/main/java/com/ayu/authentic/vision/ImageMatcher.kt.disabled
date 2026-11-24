@@ -1,0 +1,134 @@
+package com.ayu.authentic.vision
+
+import android.graphics.Bitmap
+import com.ayu.authentic.config.Config
+import com.ayu.authentic.model.Phase
+import com.ayu.authentic.model.Station
+import com.ayu.authentic.util.ALog
+import kotlin.math.abs
+
+/**
+ * 图色匹配封装类（混合方案的游戏内层）
+ *
+ * - 不使用全局 OCR / 视觉模型；
+ * - 对 UE4 渲染帧做「区域找色 + 模板相似度」；
+ * - 输出的是【基准坐标】，交给 GestureDispatcher 缩放后点击；
+ * - 模板未落地时退化为纯找色，仍能跑，只是置信度低（真机替换图片库后提升）。
+ */
+class ImageMatcher(
+    private val library: FeatureLibrary = FeatureLibrary
+) {
+
+    data class Match(
+        val station: Station,
+        val phase: Phase,
+        val confidence: Float,
+        /** 命中点（基准 2400x1080），用于点击收取 */
+        val cx: Int,
+        val cy: Int,
+        /** 从画面里读到的倒计时秒数，读不到为 -1 */
+        val remainSec: Long = -1L
+    )
+
+    /**
+     * 对一帧截图做四台子识别。
+     * @param frame 屏幕截图（建议已是 2400x1080 或由调用方缩放）
+     */
+    fun matchFrame(frame: Bitmap): List<Match> {
+        val out = mutableListOf<Match>()
+        val scaled = if (frame.width == Config.BASE_W && frame.height == Config.BASE_H)
+            frame else Bitmap.createScaledBitmap(frame, Config.BASE_W, Config.BASE_H, true)
+
+        for (station in Station.values()) {
+            val region = Config.STATION_REGIONS[station] ?: continue
+            var best: Match? = null
+            for (f in library.featuresOf(station)) {
+                val colorScore = colorScore(scaled, f.colorRules)
+                val tplScore = templateScore(f)          // 模板未落地返回 0
+                val conf = if (tplScore > 0f) 0.45f * colorScore + 0.55f * tplScore else colorScore
+                if (conf >= f.threshold && (best == null || conf > best.confidence)) {
+                    best = Match(
+                        station = station,
+                        phase = f.phase,
+                        confidence = conf,
+                        cx = region.cx,
+                        cy = region.cy,
+                        remainSec = readCountdown(scaled, region)
+                    )
+                }
+            }
+            best?.let { out.add(it) }
+        }
+        scaled.recycle()
+        return out
+    }
+
+    /** 区域找色：统计 roi 内命中任一 ColorRule 的像素比例 */
+    private fun colorScore(bmp: Bitmap, rules: List<ColorRule>): Float {
+        if (rules.isEmpty()) return 0f
+        var best = 0f
+        for (rule in rules) {
+            var hits = 0
+            var total = 0
+            val tr = (rule.argb shr 16) and 0xFF
+            val tg = (rule.argb shr 8) and 0xFF
+            val tb = rule.argb and 0xFF
+            var y = rule.roi.top
+            while (y < rule.roi.bottom && y < bmp.height) {
+                var x = rule.roi.left
+                while (x < rule.roi.right && x < bmp.width) {
+                    val c = bmp.getPixel(x, y)
+                    val r = (c shr 16) and 0xFF
+                    val g = (c shr 8) and 0xFF
+                    val b = c and 0xFF
+                    if (abs(r - tr) <= rule.tolerance &&
+                        abs(g - tg) <= rule.tolerance &&
+                        abs(b - tb) <= rule.tolerance
+                    ) hits++
+                    total++
+                    x += 2
+                }
+                y += 2
+            }
+            if (hits >= rule.minHitPixels && total > 0) {
+                best = maxOf(best, (hits.toFloat() / total).coerceAtMost(1f))
+            }
+        }
+        return best
+    }
+
+    /**
+     * 模板相似度：真机上由 TemplateStore 加载 features/stations 目录下的 png 模板后做 NCC/SSIM。
+     * 这里预留接口，模板未注册返回 0f（纯找色兜底）。
+     */
+    private fun templateScore(f: TemplateFeature): Float = TemplateStore.similarity(f)
+
+    /**
+     * 倒计时读取预留：生产中的卡片上有 mm:ss 字样，真机可用「小字模模板」比对。
+     * 当前返回 -1（由状态机用 finishAtMs 推算），不依赖 OCR。
+     */
+    private fun readCountdown(bmp: Bitmap, region: Config.Region): Long = -1L
+}
+
+/**
+ * 模板仓库：真机把采集到的模板 Bitmap 按 feature.id 注册进来，
+ * ImageMatcher 会自动把模板分纳入置信度。
+ */
+object TemplateStore {
+    private val templates = mutableMapOf<String, Bitmap>()
+    private val scores = mutableMapOf<String, Float>()
+
+    fun put(id: String, bmp: Bitmap, precomputedScore: Float = 0.85f) {
+        templates[id] = bmp
+        scores[id] = precomputedScore
+    }
+
+    /** 未注册模板返回 0 = 不用模板分，纯找色 */
+    fun similarity(f: TemplateFeature): Float = scores[f.id] ?: 0f
+
+    fun clear() { templates.clear(); scores.clear() }
+
+    fun count(): Int = templates.size.also {
+        ALog.i("TemplateStore: 已注册 $it 张模板")
+    }
+}

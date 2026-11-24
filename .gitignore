@@ -1,0 +1,150 @@
+# ============================================================
+# 本地私有配置（最高优先级：含本机路径 / 密钥 / 账号，绝不上传）
+# ============================================================
+local.properties
+*.keystore
+*.jks
+keystore.properties
+signing.properties
+credentials.json
+secrets.*
+.env
+.env.*
+*_secret*
+account*.json
+accounts.json
+
+# ------------------------------------------------------------
+# 真实账号 / 日志 / 状态数据（运行时产生，含隐私，禁止上传）
+# ------------------------------------------------------------
+*.log
+authentic_log.txt
+station_status*.txt
+touch_event.log
+
+# ============================================================
+# Python（标准）
+# ============================================================
+# 字节码 / 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.Python
+
+# 打包 / 分发
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 测试 / 覆盖率缓存
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints
+
+# mypy / ruff / pyright
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pyre/
+
+# ============================================================
+# Android / Gradle / Kotlin
+# ============================================================
+# Gradle
+.gradle/
+gradle-app.setting
+.gradletasknamecache
+!gradle/wrapper/gradle-wrapper.jar
+
+# 构建产物（源码里的 app/build/ 与根 build/ 都忽略）
+**/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+misc.xml
+deploymentTargetDropDown.xml
+render.experimental.xml
+
+# Kotlin
+.kotlin/
+
+# ============================================================
+# 截图 / 图像素材（含界面信息与调试数据，禁止上传）
+# ============================================================
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+screenshots/
+captures/
+verify_frames/
+features/
+# 例外：assets/templates 下的模板图是程序运行必需，允许入库
+!app/src/main/assets/templates/
+!app/src/main/assets/templates/**
+!app/src/main/assets/templates/digits/
+!app/src/main/assets/templates/digits/**
+
+# ============================================================
+# 工作记忆 / 交接文档 / 备份（内部资料，禁止上传）
+# ============================================================
+.workbuddy/
+HANDOVER.md
+NEW_TASK_BRIEF.md
+backup_*/
+*.zip
+
+# ============================================================
+# 操作系统 / 编辑器
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   MVP 阶段三：
+   - canPerformGestures=true       游戏内按坐标 dispatchGesture 点击
+   - canRetrieveWindowContent=true 微信/QQ 授权页按原生节点文本点「同意/切换账号/选号」
+   - flagReportViewIds             便于按 ViewId 定位（若 ROM 支持）
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/accessibility_desc"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFlags="flagDefault|flagReportViewIds"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="100"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:settingsActivity="com.ayu.authentic.MainActivity" />

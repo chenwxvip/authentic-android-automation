@@ -1,0 +1,35 @@
+package com.ayu.authentic.core
+
+import com.ayu.authentic.config.Config
+import com.ayu.authentic.model.AccountError
+import com.ayu.authentic.util.ALog
+
+/**
+ * 风控与状态拦截
+ * 从系统层节点文本（不是 OCR）里捕获「仓库空间不足 / 兑换币不足」等，
+ * 命中就把账号置为暂停并记日志，状态机随后切下一个号。
+ */
+class RiskGuard(private val repo: AccountRepository) {
+
+    /** 返回是否命中了需要拦截的异常 */
+    fun inspect(accountId: String, nodeTexts: List<String>): AccountError {
+        if (nodeTexts.isEmpty()) return AccountError.NONE
+        val joined = nodeTexts.joinToString(" ")
+        val err = when {
+            joined.contains(Config.RiskWords.WAREHOUSE_FULL) -> AccountError.WAREHOUSE_FULL
+            Regex(Config.RiskWords.COIN_INSUFFICIENT).containsMatchIn(joined) -> AccountError.COIN_INSUFFICIENT
+            joined.contains("已在其它设备登录") || joined.contains("强制下线") -> AccountError.KICKED
+            else -> AccountError.NONE
+        }
+        if (err != AccountError.NONE) {
+            repo.markError(accountId, err, "节点文本命中: ${nodeTexts.filter { it.isNotBlank() }.take(3)}")
+            ALog.w("[$accountId] 风控暂停，跳过该账号，切下一个")
+        }
+        return err
+    }
+
+    /** 单账号跑超时：置未知页面并暂停 */
+    fun timeout(accountId: String) {
+        repo.markError(accountId, AccountError.UNKNOWN_PAGE, "单账号超时未完成")
+    }
+}

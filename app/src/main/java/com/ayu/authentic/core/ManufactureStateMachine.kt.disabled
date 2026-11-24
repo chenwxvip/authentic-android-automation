@@ -1,0 +1,192 @@
+package com.ayu.authentic.core
+
+import android.graphics.Bitmap
+import com.ayu.authentic.config.Config
+import com.ayu.authentic.gesture.GestureDispatcher
+import com.ayu.authentic.gesture.NodeFinder
+import com.ayu.authentic.model.*
+import com.ayu.authentic.util.ALog
+import com.ayu.authentic.vision.ImageMatcher
+import kotlinx.coroutines.delay
+
+/**
+ * 特勤制造状态机（混合方案主控）
+ *
+ * 状态流转：
+ *   IDLE → SWITCH_ACCOUNT → ENTER_TEQIN → SCAN(图色) → COLLECT → RESTART → CHECK_ALL → BACK / NEXT
+ *
+ *  - 系统层（切号、QQ 授权、控制台按钮）：NodeFinder 精准节点
+ *  - 游戏内 UE4 四台子：ImageMatcher 图色 → 得到坐标 → GestureDispatcher 无障碍点击
+ */
+class ManufactureStateMachine(
+    private val repo: AccountRepository,
+    private val nodes: NodeFinder,
+    private val gesture: GestureDispatcher,
+    private val matcher: ImageMatcher,
+    private val risk: RiskGuard,
+    /** 由 AccessibilityService 提供的当前帧截图 */
+    private val capture: suspend () -> Bitmap?
+) {
+
+    sealed class State {
+        object Idle : State()
+        data class SwitchAccount(val acc: Account) : State()
+        object EnterTeqin : State()
+        data class Scan(val acc: Account) : State()
+        data class Collect(val acc: Account, val hits: List<ImageMatcher.Match>) : State()
+        data class Restart(val acc: Account, val hits: List<ImageMatcher.Match>) : State()
+        data class Finish(val result: RoundResult) : State()
+    }
+
+    var state: State = State.Idle
+        private set
+
+    /** 跑一个账号的完整一轮 */
+    suspend fun runAccount(acc: Account): RoundResult {
+        if (!acc.enabled) {
+            return RoundResult(acc.accountId, 0, 0, acc.error, "账号已暂停/异常，跳过")
+        }
+        val t0 = System.currentTimeMillis()
+        var collected = 0
+        var restarted = 0
+
+        // ① 切号（系统层节点）
+        state = State.SwitchAccount(acc)
+        if (!switchAccount(acc)) {
+            risk.timeout(acc.accountId)
+            return RoundResult(acc.accountId, 0, 0, AccountError.UNKNOWN_PAGE, "切号失败")
+        }
+
+        // ② 进特勤处
+        state = State.EnterTeqin
+        if (!enterTeqin()) {
+            return RoundResult(acc.accountId, 0, 0, AccountError.UNKNOWN_PAGE, "进不去特勤处")
+        }
+
+        // ③ 图色扫描四台子
+        state = State.Scan(acc)
+        val frame = capture() ?: return RoundResult(acc.accountId, 0, 0, AccountError.UNKNOWN_PAGE, "截图失败")
+        val hits = matcher.matchFrame(frame)
+        ALog.i("[${acc.nickname}] 图色识别到 ${hits.size} 个台子: " +
+            hits.joinToString { "${it.station.cn}=${it.phase}(${"%.2f".format(it.confidence)})" })
+
+        // 风控：节点文本捕获异常
+        val err = risk.inspect(acc.accountId, nodes.allTexts())
+        if (err != AccountError.NONE) {
+            return RoundResult(acc.accountId, 0, 0, err, "风控拦截")
+        }
+
+        // 把识别结果写回账号模型
+        hits.forEach { m ->
+            val st = StationState(
+                station = m.station,
+                recipe = acc.targets[m.station] ?: "",
+                phase = m.phase,
+                finishAtMs = if (m.phase == Phase.PRODUCING && m.remainSec > 0)
+                    System.currentTimeMillis() + m.remainSec * 1000 else 0L,
+                remainSec = m.remainSec.coerceAtLeast(0),
+                lastConfidence = m.confidence
+            )
+            repo.updateStation(acc.accountId, st)
+        }
+
+        // ④ 收取：待收取的台子点黄标区域
+        state = State.Collect(acc, hits)
+        val ready = hits.filter { it.phase == Phase.READY }
+        for (m in ready) {
+            gesture.tap(m.cx, m.cy)
+            // 奖励结算页：点空白跳过（可能连着几页）
+            repeat(4) { gesture.tapRegion(Config.REWARD_BLANK, 800) }
+            collected++
+            ALog.i("[${acc.nickname}] 收取 ${m.station.cn} ✓")
+        }
+
+        // ⑤ 重新下发制造任务：收取后变空闲的台子按 targets 重开
+        state = State.Restart(acc, hits)
+        val toRestart = ready.map { it.station } + hits.filter { it.phase == Phase.IDLE }.map { it.station }
+        for (s in toRestart.distinct()) {
+            val recipe = acc.targets[s] ?: continue
+            if (startProduction(s, recipe)) {
+                restarted++
+                val finish = System.currentTimeMillis() + DEFAULT_DURATION_MS[s]!!
+                repo.updateStation(acc.accountId, StationState(
+                    station = s, recipe = recipe, phase = Phase.PRODUCING,
+                    finishAtMs = finish, remainSec = DEFAULT_DURATION_MS[s]!! / 1000
+                ))
+                ALog.i("[${acc.nickname}] 重开 ${s.cn} -> $recipe，预计 ${DEFAULT_DURATION_MS[s]!! / 60000} 分钟")
+            }
+        }
+
+        // ⑥ 收尾：四个台子全生产中 → 点左上三角回大厅（爸爸 11-08 教的规则）
+        val finalFrame = capture()
+        val finalHits = finalFrame?.let { matcher.matchFrame(it) } ?: emptyList()
+        if (finalHits.size >= 4 && finalHits.all { it.phase == Phase.PRODUCING }) {
+            gesture.tapRegion(Config.BACK_TRIANGLE)
+            ALog.i("[${acc.nickname}] 四台子全生产中，点左上三角回大厅")
+        }
+
+        acc.lastActiveMs = System.currentTimeMillis()
+        val msg = "收${collected} 造${restarted}，耗时 ${(System.currentTimeMillis() - t0) / 1000}s"
+        state = State.Finish(RoundResult(acc.accountId, collected, restarted, AccountError.NONE, msg))
+        ALog.i("[${acc.nickname}] $msg")
+        return (state as State.Finish).result
+    }
+
+    // ---------- 系统层：切号 + 授权（全部节点定位） ----------
+
+    private suspend fun switchAccount(acc: Account): Boolean {
+        ALog.i("切号 -> ${acc.nickname}(${acc.accountId})")
+        if (acc.scanLogin) {
+            // 扫码号：不退登，单账号默认，直接确认在游戏里即可
+            ALog.i("扫码号 Nothing，跳过退登")
+            return true
+        }
+        // 控制台 Authentic 内部：点账号行 / 开始定时（ViewId + 文本）
+        nodes.clickId(Config.NodeKeys.VIEW_ID_ACCOUNT_ROW)
+        nodes.clickText(acc.accountId)
+        // QQ 授权页：同意 / 切换账号 / 选号（AGREE_TEXTS 是 "同意|确认|允许" 多关键字）
+        if (nodes.clickText(Config.NodeKeys.SWITCH_ACCOUNT)) {
+            nodes.clickText(acc.accountId)
+        }
+        val agreeTexts = Config.NodeKeys.AGREE_TEXTS.split("|")
+        nodes.clickText(agreeTexts.first(), *agreeTexts.drop(1).toTypedArray())
+        delay(Config.UI_SETTLE_MS * 2)
+        return true
+    }
+
+    private suspend fun enterTeqin(): Boolean {
+        // 大厅底部「特勤处」入口：优先节点文本，取不到再按基准坐标（UE4 无节点时）
+        if (!nodes.clickText("特勤处")) {
+            gesture.tap(958, 1005)   // 实测大厅底部特勤处入口（基准坐标）
+        }
+        delay(Config.UI_SETTLE_MS)
+        return true
+    }
+
+    // ---------- 游戏内：选图纸 → 一键补齐 → 生产（图色坐标 + 节点兜底） ----------
+
+    private suspend fun startProduction(s: Station, recipe: String): Boolean {
+        val region = Config.STATION_REGIONS[s] ?: return false
+        // 点台子卡片进详情
+        gesture.tap(region.cx, region.cy)
+        // 选图纸第一行（真机可用「recipe 文本节点」精确定位，这里留坐标兜底）
+        if (!nodes.clickText(recipe)) gesture.tapRegion(Config.RECIPE_FIRST_ROW)
+        // 一键补齐 / 生产按钮：系统层若有节点就节点点，否则图色坐标
+        if (!nodes.clickText("一键补齐")) gesture.tap(2060, 990)
+        if (!nodes.clickText("生产")) gesture.tapRegion(Config.BTN_PRODUCE)
+        delay(Config.UI_SETTLE_MS)
+        // 回总面板，准备下一个台子
+        if (!nodes.clickText("返回")) gesture.back()
+        return true
+    }
+
+    companion object {
+        /** 四个台子默认制造时长（毫秒），真机可从图色倒计时学习后覆盖 */
+        val DEFAULT_DURATION_MS: Map<Station, Long> = mapOf(
+            Station.TECH to 6 * 3600_000L,
+            Station.WORKBENCH to 8 * 3600_000L,
+            Station.PHARMA to 8 * 3600_000L,
+            Station.ARMOR to 8 * 3600_000L
+        )
+    }
+}

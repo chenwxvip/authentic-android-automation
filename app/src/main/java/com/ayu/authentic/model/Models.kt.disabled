@@ -1,0 +1,106 @@
+package com.ayu.authentic.model
+
+/**
+ * Authentic / GAuto 混合方案 · 数据模型
+ *
+ * 设计原则：
+ *  - 系统层（Authentic 控制台、QQ 授权页）走无障碍节点定位；
+ *  - 游戏内 UE4 渲染画面走图色模板/找色，取到坐标后再用无障碍手势点击。
+ *  - 所有“图色特征”只存元数据（区域 + 颜色规则 + 模板名），真机上替换 features/ 下的图片库即可。
+ */
+
+/** 四个制造台 */
+enum class Station(val cn: String, val slot: Int) {
+    TECH("技术中心", 0),
+    WORKBENCH("工作台", 1),
+    PHARMA("制药台", 2),
+    ARMOR("防具台", 3);
+
+    companion object {
+        fun of(name: String): Station? = values().firstOrNull { it.cn == name || it.name == name }
+    }
+}
+
+/** 单个制造台的运行时状态 */
+data class StationState(
+    val station: Station,
+    /** 制造配方名，如 ".300BLK" / "重型突击背心" */
+    var recipe: String = "",
+    /** 状态：生产中 / 待收取 / 空闲 */
+    var phase: Phase = Phase.IDLE,
+    /** 该台子预计完成时间（epoch 毫秒），0 表示无 */
+    var finishAtMs: Long = 0L,
+    /** 剩余秒数快照，仅用于面板展示 */
+    var remainSec: Long = 0L,
+    /** 最近一次图色识别的置信度 0f..1f */
+    var lastConfidence: Float = 0f
+) {
+    val isDue: Boolean
+        get() = phase == Phase.READY || (phase == Phase.PRODUCING && finishAtMs in 1..System.currentTimeMillis())
+
+    fun toPersistString(): String = listOf(
+        station.name, recipe, phase.name, finishAtMs.toString(), remainSec.toString()
+    ).joinToString("|")
+}
+
+enum class Phase { IDLE, PRODUCING, READY }
+
+/** 账号异常状态枚举（风控拦截依据） */
+enum class AccountError {
+    NONE,               // 正常
+    WAREHOUSE_FULL,     // 仓库空间不足
+    COIN_INSUFFICIENT,  // 兑换币/哈夫币不足
+    PAUSED,             // 手动暂停
+    KICKED,             // 被顶号 / 授权失效
+    UNKNOWN_PAGE        // 停在不认识的界面，超时后暂停
+}
+
+/**
+ * 账号模型
+ *  @param accountId QQ/微信账号 ID（扫码号填 "Nothing"，不退登）
+ *  @param pkg 游戏/控制台包名，用于隔离
+ */
+data class Account(
+    val accountId: String,
+    val nickname: String = "",
+    var level: Int = 0,
+    var hafCoins: Long = 0L,
+    var error: AccountError = AccountError.NONE,
+    var paused: Boolean = false,
+    /** 扫码号：不点退出登录，单账号运行 */
+    val scanLogin: Boolean = accountId.equals("Nothing", ignoreCase = true),
+    val stations: MutableMap<Station, StationState> = defaultStations(),
+    /** 每个台子要下发的配方 */
+    val targets: MutableMap<Station, String> = defaultTargets(),
+    var lastActiveMs: Long = 0L,
+    var note: String = ""
+) {
+    val enabled: Boolean get() = !paused && error == AccountError.NONE
+
+    fun isAnyDue(now: Long = System.currentTimeMillis()): Boolean =
+        stations.values.any { it.phase == Phase.READY || (it.finishAtMs in 1..now) }
+
+    fun earliestDueMs(): Long =
+        stations.values.map { it.finishAtMs }.filter { it > 0 }.minOrNull() ?: 0L
+
+    companion object {
+        fun defaultStations(): MutableMap<Station, StationState> =
+            Station.values().associateWith { StationState(it) }.toMutableMap()
+
+        fun defaultTargets(): MutableMap<Station, String> = mutableMapOf(
+            Station.TECH to ".300BLK",
+            Station.WORKBENCH to "重型突击背心",
+            Station.PHARMA to "战地医疗箱",
+            Station.ARMOR to "5.45x39mm BT"
+        )
+    }
+}
+
+/** 一次轮询的账号级结果，交给状态机决定下一步 */
+data class RoundResult(
+    val accountId: String,
+    val collected: Int,
+    val restarted: Int,
+    val error: AccountError,
+    val message: String
+)

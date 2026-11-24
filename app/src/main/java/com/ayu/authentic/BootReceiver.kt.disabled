@@ -1,0 +1,19 @@
+package com.ayu.authentic
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import com.ayu.authentic.service.AuthenticAccessibilityService
+import com.ayu.authentic.util.ALog
+
+/** 开机后恢复「开启定时」总开关（上次关着就不自启） */
+class BootReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        val prefs = context.getSharedPreferences("authentic", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("timer_on", false)) {
+            context.sendBroadcast(Intent(AuthenticAccessibilityService.ACTION_START))
+            ALog.i("开机恢复定时")
+        }
+    }
+}

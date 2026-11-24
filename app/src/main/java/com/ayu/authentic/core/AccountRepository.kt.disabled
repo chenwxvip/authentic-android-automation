@@ -1,0 +1,104 @@
+package com.ayu.authentic.core
+
+import com.ayu.authentic.model.Account
+import com.ayu.authentic.model.AccountError
+import com.ayu.authentic.model.Station
+import com.ayu.authentic.model.StationState
+import com.ayu.authentic.util.ALog
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * 账号仓库：内存态 + JSON 持久化（可换成 Room/DataStore）。
+ * 负责：账号增删改、台子状态落盘、异常状态标记。
+ */
+class AccountRepository {
+
+    private val accounts = LinkedHashMap<String, Account>()
+
+    fun all(): List<Account> = accounts.values.toList()
+    fun get(id: String): Account? = accounts[id]
+    fun enabled(): List<Account> = all().filter { it.enabled }
+
+    fun upsert(a: Account) {
+        accounts[a.accountId] = a
+        ALog.i("账号入库 ${a.nickname}(${a.accountId}) lvl=${a.level} 币=${a.hafCoins}")
+    }
+
+    fun markError(id: String, err: AccountError, note: String = "") {
+        val a = accounts[id] ?: return
+        a.error = err
+        if (note.isNotEmpty()) a.note = note
+        ALog.w("风控拦截 ${a.nickname} -> $err ${note}")
+    }
+
+    fun clearError(id: String) {
+        accounts[id]?.let { it.error = AccountError.NONE; it.note = "" }
+    }
+
+    fun pause(id: String, on: Boolean) { accounts[id]?.paused = on }
+
+    fun updateStation(id: String, s: StationState) {
+        accounts[id]?.stations?.put(s.station, s)
+    }
+
+    /** 序列化：给控制台 App 面板 / 云控上报用 */
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("updated", System.currentTimeMillis())
+        put("accounts", JSONArray().also { arr ->
+            all().forEach { a ->
+                arr.put(JSONObject().apply {
+                    put("id", a.accountId)
+                    put("nick", a.nickname)
+                    put("level", a.level)
+                    put("coins", a.hafCoins)
+                    put("error", a.error.name)
+                    put("paused", a.paused)
+                    put("stations", JSONArray().also { ss ->
+                        a.stations.values.forEach { st ->
+                            ss.put(JSONObject().apply {
+                                put("station", st.station.name)
+                                put("recipe", st.recipe)
+                                put("phase", st.phase.name)
+                                put("finishAtMs", st.finishAtMs)
+                                put("remainSec", st.remainSec)
+                            })
+                        }
+                    })
+                })
+            }
+        })
+    }
+
+    fun restore(json: JSONObject) {
+        val arr = json.optJSONArray("accounts") ?: return
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            val a = Account(o.getString("id"), o.optString("nick", "")).apply {
+                level = o.optInt("level", 0)
+                hafCoins = o.optLong("coins", 0L)
+                error = runCatching { AccountError.valueOf(o.optString("error", "NONE")) }
+                    .getOrDefault(AccountError.NONE)
+                paused = o.optBoolean("paused", false)
+            }
+            o.optJSONArray("stations")?.let { ss ->
+                for (j in 0 until ss.length()) {
+                    val s = ss.getJSONObject(j)
+                    val station = runCatching { Station.valueOf(s.getString("station")) }
+                        .getOrNull() ?: continue
+                    a.stations[station] = StationState(
+                        station = station,
+                        recipe = s.optString("recipe", ""),
+                        phase = runCatching {
+                            com.ayu.authentic.model.Phase.valueOf(s.optString("phase", "IDLE"))
+                        }.getOrDefault(com.ayu.authentic.model.Phase.IDLE),
+                        finishAtMs = s.optLong("finishAtMs", 0L),
+                        remainSec = s.optLong("remainSec", 0L)
+                    )
+                }
+            }
+            upsert(a)
+        }
+        ALog.i("恢复 ${arr.length()} 个账号")
+    }
+}
